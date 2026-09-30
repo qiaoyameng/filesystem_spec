@@ -16,7 +16,7 @@ from fsspec.caching import (  # noqa: F401
     ReadAheadCache,
     caches,
 )
-from fsspec.compression import compr
+from fsspec.compression import compr, peek_compression
 from fsspec.config import conf
 from fsspec.registry import available_protocols, filesystem, get_filesystem_class
 from fsspec.utils import (
@@ -50,6 +50,18 @@ class OpenFile:
         Mode of the opened file
     compression: str or None, optional
         Compression to apply
+    compression_policy: str or None, optional
+        How to resolve conflicts between the compression inferred from the
+        file name extension and the compression detected from the file
+        content, when ``compression="infer"``. One of "extension" (trust the
+        extension, only sniff content when there is none), "content" (trust
+        the content, fall back to the extension) or "strict" (raise on any
+        disagreement). If None, takes the value of the "compression_policy"
+        config value, defaulting to "extension".
+    compression_max_layers: int, optional
+        Maximum number of nested compression layers to unwrap when detecting
+        compression from content. Defaults to 1, i.e. only the outermost
+        layer is decompressed.
     encoding: str or None, optional
         The encoding to use if opened in text mode.
     errors: str or None, optional
@@ -71,11 +83,16 @@ class OpenFile:
         encoding=None,
         errors=None,
         newline=None,
+        compression_policy=None,
+        compression_max_layers=1,
     ):
         self.fs = fs
         self.path = path
         self.mode = mode
+        self._infer = compression == "infer"
         self.compression = get_compression(path, compression)
+        self.compression_policy = get_compression_policy(compression_policy)
+        self.compression_max_layers = compression_max_layers
         self.encoding = encoding
         self.errors = errors
         self.newline = newline
@@ -88,10 +105,12 @@ class OpenFile:
                 self.fs,
                 self.path,
                 self.mode,
-                self.compression,
+                "infer" if self._infer else self.compression,
                 self.encoding,
                 self.errors,
                 self.newline,
+                self.compression_policy,
+                self.compression_max_layers,
             ),
         )
 
@@ -116,7 +135,9 @@ class OpenFile:
 
         self.fobjects = [f]
 
-        if self.compression is not None:
+        if self._infer and "r" in mode:
+            f = self._open_inferred_compression(f, mode[0])
+        elif self.compression is not None:
             compress = compr[self.compression]
             f = compress(f, mode=mode[0])
             self.fobjects.append(f)
@@ -129,6 +150,50 @@ class OpenFile:
             self.fobjects.append(f)
 
         return self.fobjects[-1]
+
+    def _apply_compression(self, f, name, mode):
+        """Wrap ``f`` with the named decompressor and track it for closing."""
+        wrapper = compr[name](f, mode=mode)
+        self.fobjects.append(wrapper)
+        return wrapper
+
+    def _open_inferred_compression(self, f, mode):
+        """Resolve ``compression="infer"`` for a file opened for reading.
+
+        Combines the compression inferred from the file name extension with
+        magic-byte detection on the content, according to
+        ``self.compression_policy``. Content detection only reads a few
+        bytes per layer and never consumes payload data.
+        """
+        ext = self.compression
+        policy = self.compression_policy
+        if policy == "extension" and ext is not None:
+            return self._apply_compression(f, ext, mode)
+
+        current = f
+        names = []
+        for layer in range(max(1, int(self.compression_max_layers))):
+            previous = current
+            # decompressor streams may claim to be seekable without being
+            # able to rewind, so only the raw file is inspected via seek
+            name, current = peek_compression(current, try_seek=layer == 0)
+            if current is not previous:
+                self.fobjects.append(current)
+            if name is None:
+                break
+            if not names and policy == "strict" and ext is not None and name != ext:
+                self.close()
+                raise ValueError(
+                    f"Compression {ext!r} inferred from the extension of "
+                    f"{self.path!r} conflicts with {name!r} detected from "
+                    "its content"
+                )
+            current = self._apply_compression(current, name, mode)
+            names.append(name)
+
+        if not names and ext is not None:
+            current = self._apply_compression(current, ext, mode)
+        return current
 
     def __exit__(self, *args):
         self.close()
@@ -221,6 +286,8 @@ def open_files(
     urlpath,
     mode="rb",
     compression=None,
+    compression_policy=None,
+    compression_max_layers=1,
     encoding="utf8",
     errors=None,
     name_function=None,
@@ -249,7 +316,18 @@ def open_files(
     compression: string or None
         If given, open file using compression codec. Can either be a compression
         name (a key in ``fsspec.compression.compr``) or "infer" to guess the
-        compression from the filename suffix.
+        compression from the filename suffix, falling back to detection from
+        the file's content (magic bytes) when the suffix is absent or unknown.
+    compression_policy: string or None
+        How to resolve conflicts between the compression inferred from the
+        filename suffix and the one detected from the content when
+        ``compression="infer"``: "extension" (default; trust the suffix, only
+        sniff content when there is none), "content" (trust the content) or
+        "strict" (raise ValueError on disagreement). If None, takes the value
+        of the "compression_policy" config value.
+    compression_max_layers: int
+        Maximum number of nested compression layers to unwrap when detecting
+        compression from content. Defaults to 1 (only the outermost layer).
     encoding: str
         For text mode only
     errors: None or str
@@ -321,6 +399,8 @@ def open_files(
                 path,
                 mode=mode,
                 compression=compression,
+                compression_policy=compression_policy,
+                compression_max_layers=compression_max_layers,
                 encoding=encoding,
                 errors=errors,
                 newline=newline,
@@ -412,6 +492,8 @@ def url_to_fs(url, **kwargs):
     # inspect could keep this in sync with open()'s signature
     known_kwargs = {
         "compression",
+        "compression_policy",
+        "compression_max_layers",
         "encoding",
         "errors",
         "expand",
@@ -444,6 +526,8 @@ def open(
     urlpath,
     mode="rb",
     compression=None,
+    compression_policy=None,
+    compression_max_layers=1,
     encoding="utf8",
     errors=None,
     protocol=None,
@@ -463,7 +547,18 @@ def open(
     compression: string or None
         If given, open file using compression codec. Can either be a compression
         name (a key in ``fsspec.compression.compr``) or "infer" to guess the
-        compression from the filename suffix.
+        compression from the filename suffix, falling back to detection from
+        the file's content (magic bytes) when the suffix is absent or unknown.
+    compression_policy: string or None
+        How to resolve conflicts between the compression inferred from the
+        filename suffix and the one detected from the content when
+        ``compression="infer"``: "extension" (default; trust the suffix, only
+        sniff content when there is none), "content" (trust the content) or
+        "strict" (raise ValueError on disagreement). If None, takes the value
+        of the "compression_policy" config value.
+    compression_max_layers: int
+        Maximum number of nested compression layers to unwrap when detecting
+        compression from content. Defaults to 1 (only the outermost layer).
     encoding: str
         For text mode only
     errors: None or str
@@ -513,6 +608,8 @@ def open(
         urlpath=[urlpath],
         mode=mode,
         compression=compression,
+        compression_policy=compression_policy,
+        compression_max_layers=compression_max_layers,
         encoding=encoding,
         errors=errors,
         protocol=protocol,
@@ -564,6 +661,27 @@ def get_compression(urlpath, compression):
     if compression is not None and compression not in compr:
         raise ValueError(f"Compression type {compression} not supported")
     return compression
+
+
+#: Valid values for the compression conflict resolution policy, see
+#: ``OpenFile`` and ``fsspec.open``.
+COMPRESSION_POLICIES = ("extension", "content", "strict")
+
+
+def get_compression_policy(policy):
+    """Resolve and validate the compression conflict resolution policy.
+
+    A policy of None (the default) takes the value of the
+    "compression_policy" config value, or "extension" if that is not set.
+    """
+    if policy is None:
+        policy = conf.get("compression_policy", "extension")
+    if policy not in COMPRESSION_POLICIES:
+        raise ValueError(
+            f"compression_policy must be one of {COMPRESSION_POLICIES}, "
+            f"got {policy!r}"
+        )
+    return policy
 
 
 def split_protocol(urlpath):

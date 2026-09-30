@@ -74,6 +74,28 @@ From the user's point of view, this is achieved simply by passing arguments to
 the :func:`fsspec.open_files` or :func:`fsspec.open` functions, and
 thereafter happens transparently.
 
+With ``compression="infer"``, the compression codec is normally guessed from the
+filename suffix. When the suffix is missing or unknown (as is common for data
+files without extensions), the codec is instead detected from the file's
+*content*: a few leading magic bytes are inspected and matched against the
+signatures registered via :func:`fsspec.compression.register_compression`. The
+bytes read for detection are put back, so no payload is consumed, and
+non-seekable streams are supported. Detection never reads the whole file.
+
+If the suffix and the content disagree, the behaviour is governed by the
+``compression_policy`` argument (or the ``compression_policy`` config value):
+
+- ``"extension"`` (default): trust the suffix; only sniff the content when
+  there is no known suffix
+- ``"content"``: trust the content; fall back to the suffix when no known
+  signature is found
+- ``"strict"``: raise ``ValueError`` when suffix and content identify
+  different codecs
+
+Nested compression (e.g. a gzip file within a gzip file) is unwrapped one
+layer at a time and only the outermost layer is decompressed by default; pass
+``compression_max_layers`` to explicitly allow deeper unwrapping.
+
 Key-value stores
 ----------------
 
