@@ -10,7 +10,7 @@ from itertools import chain
 from typing import TYPE_CHECKING, Literal
 
 import fsspec.core
-from fsspec.spec import AbstractBufferedFile
+from fsspec.spec import AbstractBufferedFile, AbstractFileSystem
 
 try:
     import ujson as json
@@ -32,14 +32,187 @@ from fsspec.utils import (
 logger = logging.getLogger("fsspec.reference")
 
 
+class ReferenceLengthOverflow(ValueError):
+    def __init__(self, reference, segment, target, expected, actual, *args):
+        super().__init__(*args)
+        self.reference = reference
+        self.segment = segment
+        self.target = target
+        self.expected = expected
+        self.actual = actual
+
+    def __str__(self):
+        return (
+            f'Reference "{self.reference}" segment {self.segment} requested '
+            f"{self.expected} bytes from {self.target}, but got {self.actual}"
+        )
+
+
 class ReferenceNotReachable(RuntimeError):
-    def __init__(self, reference, target, *args):
+    def __init__(self, reference, target, segment=None, *args):
         super().__init__(*args)
         self.reference = reference
         self.target = target
+        self.segment = segment
 
     def __str__(self):
-        return f'Reference "{self.reference}" failed to fetch target {self.target}'
+        location = f" segment {self.segment}" if self.segment is not None else ""
+        return (
+            f'Reference "{self.reference}"{location} failed to fetch target '
+            f"{self.target}"
+        )
+
+
+def _is_multi_segment_reference(part):
+    if isinstance(part, dict):
+        return "segments" in part
+    if isinstance(part, (list, tuple)):
+        return any(
+            isinstance(item, dict)
+            and (
+                item.get("type") in {"data", "zero", "remote"}
+                or any(key in item for key in ("data", "inline", "bytes"))
+                or any(key in item for key in ("zero", "zeros"))
+                or any(key in item for key in ("url", "path", "target"))
+            )
+            for item in part
+        )
+    return False
+
+
+def _inline_bytes(part):
+    if isinstance(part, str):
+        if part.startswith("base64:"):
+            return base64.b64decode(part[7:])
+        return part.encode()
+    if isinstance(part, bytes):
+        if part.startswith(b"base64:"):
+            return base64.b64decode(part[7:])
+        return part
+    return None
+
+
+def _normalize_segment(segment, index):
+    if isinstance(segment, int) and not isinstance(segment, bool):
+        length = int(segment)
+        if length < 0:
+            raise ValueError(f"Segment {index} zero length cannot be negative")
+        return {"type": "zero", "length": length}
+
+    if isinstance(segment, dict):
+        if segment.get("type") in {"data", "zero", "remote"}:
+            normalized = dict(segment)
+            if normalized["type"] == "data" and isinstance(normalized.get("data"), str):
+                normalized["data"] = _inline_bytes(normalized["data"])
+                normalized["length"] = len(normalized["data"])
+            return normalized
+
+        if any(key in segment for key in ("data", "inline", "bytes")):
+            for key in ("data", "inline", "bytes"):
+                if key in segment:
+                    value = segment[key]
+                    break
+            if isinstance(value, str):
+                if value.startswith("base64:"):
+                    value = base64.b64decode(value[7:])
+                else:
+                    value = value.encode()
+            if not isinstance(value, bytes):
+                raise TypeError(f"Segment {index} inline data must be bytes")
+            return {"type": "data", "data": value, "length": len(value)}
+
+        if any(key in segment for key in ("url", "path", "target")):
+            for key in ("url", "path", "target"):
+                if key in segment:
+                    url = segment[key]
+                    break
+            offset = int(segment.get("offset", 0))
+            length = segment.get("length", segment.get("size"))
+            if offset < 0:
+                raise ValueError(f"Segment {index} offset cannot be negative")
+            if length is None:
+                return {"type": "remote", "url": url, "offset": offset, "length": None}
+            length = int(length)
+            if length < 0:
+                raise ValueError(f"Segment {index} length cannot be negative")
+            return {
+                "type": "remote",
+                "url": url,
+                "offset": offset,
+                "length": length,
+            }
+
+        if any(key in segment for key in ("zero", "zeros", "size")):
+            for key in ("zero", "zeros", "size"):
+                if key in segment:
+                    length = segment[key]
+                    break
+            length = int(length)
+            if length < 0:
+                raise ValueError(f"Segment {index} zero length cannot be negative")
+            return {"type": "zero", "length": length}
+
+        raise ValueError(f"Segment {index} must contain data, zero, or a URL")
+
+    if isinstance(segment, (bytes, str)):
+        data = _inline_bytes(segment)
+        return {"type": "data", "data": data, "length": len(data)}
+
+    if isinstance(segment, (list, tuple)):
+        if len(segment) == 1:
+            return {
+                "type": "remote",
+                "url": segment[0],
+                "offset": 0,
+                "length": None,
+            }
+        if len(segment) == 3:
+            url, offset, length = segment
+            offset = int(offset)
+            length = int(length)
+            if offset < 0 or length < 0:
+                raise ValueError(f"Segment {index} offsets and lengths must be >= 0")
+            return {
+                "type": "remote",
+                "url": url,
+                "offset": offset,
+                "length": length,
+            }
+
+    raise TypeError(f"Unsupported type for segment {index}: {type(segment)!r}")
+
+
+def _normalize_multi_segment_reference(part):
+    if isinstance(part, dict):
+        segments = part["segments"]
+    else:
+        segments = part
+    if not isinstance(segments, (list, tuple)) or not segments:
+        raise ValueError("A multi-segment reference must contain at least one segment")
+    return {
+        "segments": [
+            _normalize_segment(segment, index)
+            for index, segment in enumerate(segments)
+        ]
+    }
+
+
+def _normalize_virtual_range(start, end, size):
+    if start is None:
+        start = 0
+    elif start < 0:
+        start = max(size + start, 0)
+    else:
+        start = min(start, size)
+
+    if end is None:
+        end = size
+    elif end < 0:
+        end = max(size + end, 0)
+    else:
+        end = min(end, size)
+
+    return start, max(start, end)
 
 
 def _first(d):
@@ -617,6 +790,13 @@ class ReferenceFileSystem(AsyncFileSystem):
     {path0: bytes_data, path1: (target_url, offset, size)}
     https://github.com/fsspec/kerchunk/blob/main/README.md
 
+    A virtual file can also be composed from ordered segments with
+    ``{"segments": [...]}``. A segment is a remote range
+    ``{"url": url, "offset": start, "length": n}`` (or the legacy
+    ``(url, start, n)`` form), inline bytes ``{"data": value}``, or an explicit
+    zero-filled region ``{"zero": n}``. Reads and seeks use offsets in the
+    virtual file, and only the intersecting remote ranges are fetched.
+
     simple_references: if True (default), no jinja interpreting is done,
         which is the safe option.
     """
@@ -833,7 +1013,254 @@ class ReferenceFileSystem(AsyncFileSystem):
             url = self.target
         return url, start1, end1
 
+    def _reference_segments(self, path):
+        try:
+            part = self.references[path]
+        except KeyError as exc:
+            raise FileNotFoundError(path) from exc
+        if not _is_multi_segment_reference(part):
+            raise ValueError(f"{path} is not a multi-segment reference")
+        return _normalize_multi_segment_reference(part)["segments"]
+
+    def _multi_segment_size(self, path):
+        segments = self._resolve_segments(
+            path, self._reference_segments(path)
+        )
+        return sum(segment["length"] for segment in segments)
+
+    def _sync_fs(self, protocol):
+        fs = self.fss[protocol]
+        return fs.sync_fs if isinstance(fs, AsyncFileSystemWrapper) else fs
+
+    def _resolve_segments(self, path, segments, end=None):
+        out = []
+        virtual_start = 0
+        for index, segment in enumerate(segments):
+            if segment["type"] != "remote" or segment["length"] is not None:
+                virtual_start += segment["length"]
+                out.append(segment)
+                continue
+
+            if end is None or virtual_start < end:
+                url = segment["url"] or self.target
+                protocol, _ = split_protocol(url)
+                try:
+                    size = self._sync_fs(protocol).size(url)
+                except Exception as e:
+                    raise ReferenceNotReachable(path, url, index) from e
+                resolved = dict(segment)
+                resolved["url"] = url
+                resolved["length"] = size - segment["offset"]
+                if resolved["length"] < 0:
+                    raise ReferenceLengthOverflow(
+                        path, index, url, 0, resolved["length"]
+                    )
+                segment = resolved
+                virtual_start += segment["length"]
+            else:
+                segment = {**segment, "length": 0}
+            out.append(segment)
+        return out
+
+    async def _resolve_segments_async(self, path, segments, end=None):
+        out = []
+        virtual_start = 0
+        for index, segment in enumerate(segments):
+            if segment["type"] != "remote" or segment["length"] is not None:
+                virtual_start += segment["length"]
+                out.append(segment)
+                continue
+
+            if end is None or virtual_start < end:
+                url = segment["url"] or self.target
+                protocol, _ = split_protocol(url)
+                try:
+                    size = await self.fss[protocol]._size(url)
+                except Exception as e:
+                    raise ReferenceNotReachable(path, url, index) from e
+                resolved = dict(segment)
+                resolved["url"] = url
+                resolved["length"] = size - segment["offset"]
+                if resolved["length"] < 0:
+                    raise ReferenceLengthOverflow(
+                        path, index, url, 0, resolved["length"]
+                    )
+                segment = resolved
+                virtual_start += segment["length"]
+            else:
+                segment = {**segment, "length": 0}
+            out.append(segment)
+        return out
+
+    def _segment_ranges(self, segments, start, end):
+        total_size = sum(segment["length"] for segment in segments)
+        start, end = _normalize_virtual_range(start, end, total_size)
+        groups = {}
+        chunks = []
+        virtual_start = 0
+
+        for index, segment in enumerate(segments):
+            segment_start = virtual_start
+            segment_end = virtual_start + segment["length"]
+            virtual_start = segment_end
+
+            intersection_start = max(start, segment_start)
+            intersection_end = min(end, segment_end)
+            if intersection_start >= intersection_end:
+                continue
+
+            out_start = intersection_start - start
+            out_end = intersection_end - start
+            if segment["type"] == "data":
+                data_start = intersection_start - segment_start
+                chunks.append(
+                    {
+                        "kind": "data",
+                        "data": segment["data"][
+                            data_start : data_start + out_end - out_start
+                        ],
+                        "out_start": out_start,
+                        "out_end": out_end,
+                    }
+                )
+            elif segment["type"] == "zero":
+                chunks.append(
+                    {
+                        "kind": "zero",
+                        "length": out_end - out_start,
+                        "out_start": out_start,
+                        "out_end": out_end,
+                    }
+                )
+            else:
+                url = segment["url"]
+                if url is None:
+                    url = self.target
+                protocol, _ = split_protocol(url)
+                offset = intersection_start - segment_start
+                request = {
+                    "index": index,
+                    "url": url,
+                    "start": segment["offset"] + offset,
+                    "end": segment["offset"] + offset + out_end - out_start,
+                    "length": out_end - out_start,
+                    "out_start": out_start,
+                    "out_end": out_end,
+                }
+                groups.setdefault(protocol, []).append(request)
+                chunks.append({"kind": "remote", **request})
+
+        return start, end, groups, chunks
+
+    def _fill_segment_ranges(self, path, groups, result):
+        for protocol, requests in groups.items():
+            fs = self._sync_fs(protocol)
+            try:
+                values = fs.cat_ranges(
+                    [request["url"] for request in requests],
+                    [request["start"] for request in requests],
+                    [request["end"] for request in requests],
+                    on_error="return",
+                )
+            except Exception as e:
+                index = requests[0]["index"]
+                url = requests[0]["url"]
+                raise ReferenceNotReachable(path, url, index) from e
+
+            for request, value in zip(requests, values):
+                if isinstance(value, Exception):
+                    raise ReferenceNotReachable(
+                        path, request["url"], request["index"]
+                    ) from value
+                if len(value) != request["length"]:
+                    raise ReferenceLengthOverflow(
+                        path,
+                        request["index"],
+                        request["url"],
+                        request["length"],
+                        len(value),
+                    )
+                result[request["out_start"] : request["out_end"]] = value
+
+    async def _fill_segment_ranges_async(self, path, groups, result):
+        for protocol, requests in groups.items():
+            fs = self.fss[protocol]
+            try:
+                values = await fs._cat_ranges(
+                    [request["url"] for request in requests],
+                    [request["start"] for request in requests],
+                    [request["end"] for request in requests],
+                    on_error="return",
+                )
+            except Exception as e:
+                index = requests[0]["index"]
+                url = requests[0]["url"]
+                raise ReferenceNotReachable(path, url, index) from e
+
+            for request, value in zip(requests, values):
+                if isinstance(value, Exception):
+                    raise ReferenceNotReachable(
+                        path, request["url"], request["index"]
+                    ) from value
+                if len(value) != request["length"]:
+                    raise ReferenceLengthOverflow(
+                        path,
+                        request["index"],
+                        request["url"],
+                        request["length"],
+                        len(value),
+                    )
+                result[request["out_start"] : request["out_end"]] = value
+
+    def _cat_segments(self, path, segments, start=None, end=None):
+        known_size = sum(segment["length"] or 0 for segment in segments)
+        has_unknown_length = any(segment["length"] is None for segment in segments)
+        requested_end = end
+        if requested_end is None or (requested_end < 0 and has_unknown_length):
+            requested_end = None
+        elif requested_end < 0:
+            requested_end = known_size + requested_end
+        segments = self._resolve_segments(
+            path,
+            segments,
+            end=requested_end,
+        )
+        start, end, groups, chunks = self._segment_ranges(segments, start, end)
+        result = bytearray(end - start)
+        self._fill_segment_ranges(path, groups, result)
+        for chunk in chunks:
+            if chunk["kind"] == "data":
+                result[chunk["out_start"] : chunk["out_end"]] = chunk["data"]
+        return bytes(result)
+
+    async def _cat_segments_async(self, path, segments, start=None, end=None):
+        known_size = sum(segment["length"] or 0 for segment in segments)
+        has_unknown_length = any(segment["length"] is None for segment in segments)
+        requested_end = end
+        if requested_end is None or (requested_end < 0 and has_unknown_length):
+            requested_end = None
+        elif requested_end < 0:
+            requested_end = known_size + requested_end
+        segments = await self._resolve_segments_async(
+            path,
+            segments,
+            end=requested_end,
+        )
+        start, end, groups, chunks = self._segment_ranges(segments, start, end)
+        result = bytearray(end - start)
+        await self._fill_segment_ranges_async(path, groups, result)
+        for chunk in chunks:
+            if chunk["kind"] == "data":
+                result[chunk["out_start"] : chunk["out_end"]] = chunk["data"]
+        return bytes(result)
+
     async def _cat_file(self, path, start=None, end=None, **kwargs):
+        path = self._strip_protocol(path)
+        part = self.references.get(path)
+        if _is_multi_segment_reference(part):
+            segments = _normalize_multi_segment_reference(part)["segments"]
+            return await self._cat_segments_async(path, segments, start, end)
+
         part_or_url, start0, end0 = self._cat_common(path, start=start, end=end)
         if isinstance(part_or_url, bytes):
             return part_or_url[start:end]
@@ -846,18 +1273,59 @@ class ReferenceFileSystem(AsyncFileSystem):
             raise ReferenceNotReachable(path, part_or_url) from e
 
     def cat_file(self, path, start=None, end=None, **kwargs):
+        path = self._strip_protocol(path)
+        part = self.references.get(path)
+        if _is_multi_segment_reference(part):
+            segments = _normalize_multi_segment_reference(part)["segments"]
+            return self._cat_segments(path, segments, start, end)
+
         part_or_url, start0, end0 = self._cat_common(path, start=start, end=end)
         if isinstance(part_or_url, bytes):
             return part_or_url[start:end]
         protocol, _ = split_protocol(part_or_url)
         try:
-            return self.fss[protocol].cat_file(part_or_url, start=start0, end=end0)
+            return self._sync_fs(protocol).cat_file(
+                part_or_url, start=start0, end=end0
+            )
         except Exception as e:
             raise ReferenceNotReachable(path, part_or_url) from e
 
     def pipe_file(self, path, value, **_):
         """Temporarily add binary data or reference as a file"""
         self.references[path] = value
+
+    def pipe(self, path, value=None, **kwargs):
+        return AbstractFileSystem.pipe(self, path, value, **kwargs)
+
+    def put_file(self, lpath, rpath, callback=DEFAULT_CALLBACK, mode="overwrite", **_):
+        if mode == "create" and self.exists(rpath):
+            raise FileExistsError
+        if os.path.isdir(lpath):
+            return None
+        with open(lpath, "rb") as f:
+            data = f.read()
+        callback.set_size(len(data))
+        self.pipe_file(rpath, data)
+        callback.absolute_update(len(data))
+
+    def put(
+        self,
+        lpath,
+        rpath,
+        recursive=False,
+        callback=DEFAULT_CALLBACK,
+        maxdepth=None,
+        **kwargs,
+    ):
+        return AbstractFileSystem.put(
+            self,
+            lpath,
+            rpath,
+            recursive=recursive,
+            callback=callback,
+            maxdepth=maxdepth,
+            **kwargs,
+        )
 
     async def _get_file(self, rpath, lpath, **kwargs):
         if self.isdir(rpath):
@@ -904,17 +1372,46 @@ class ReferenceFileSystem(AsyncFileSystem):
         if isinstance(path, list) and (recursive or any("*" in p for p in path)):
             raise NotImplementedError
         # TODO: if references is lazy, pre-fetch all paths in batch before access
-        proto_dict = _protocol_groups(path, self.references)
         out = {}
+        if isinstance(path, str) and _is_multi_segment_reference(
+            self.references.get(path)
+        ):
+            return self.cat_file(path)
+
+        if isinstance(path, list):
+            single_protocol_paths = []
+            multi_segment_paths = []
+            for item in path:
+                if _is_multi_segment_reference(self.references.get(item)):
+                    multi_segment_paths.append(item)
+                else:
+                    single_protocol_paths.append(item)
+            for item in multi_segment_paths:
+                try:
+                    out[item] = self.cat_file(item)
+                except Exception as err:
+                    if on_error == "raise":
+                        raise
+                    if on_error != "omit":
+                        out[item] = err
+            path = single_protocol_paths
+
+        proto_dict = _protocol_groups(path, self.references)
         for proto, paths in proto_dict.items():
-            fs = self.fss[proto]
+            fs = self._sync_fs(proto)
             urls, starts, ends, valid_paths = [], [], [], []
             for p in paths:
                 # find references or label not-found. Early exit if any not
                 # found and on_error is "raise"
                 try:
+                    part = self.references.get(p)
+                    if part is None:
+                        raise FileNotFoundError(p)
                     u, s, e = self._cat_common(p)
-                    if not isinstance(u, (bytes, str)):
+                    if isinstance(u, bytes):
+                        out[p] = u
+                        continue
+                    if not isinstance(u, str):
                         # nan/None from parquet
                         continue
                 except FileNotFoundError as err:
@@ -955,15 +1452,18 @@ class ReferenceFileSystem(AsyncFileSystem):
                     paths2.append(p)
 
             # merge and fetch consolidated ranges
-            new_paths, new_starts, new_ends = merge_offset_ranges(
-                list(urls2),
-                list(starts2),
-                list(ends2),
-                sort=True,
-                max_gap=self.max_gap,
-                max_block=self.max_block,
-            )
-            bytes_out = fs.cat_ranges(new_paths, new_starts, new_ends)
+            if urls2:
+                new_paths, new_starts, new_ends = merge_offset_ranges(
+                    list(urls2),
+                    list(starts2),
+                    list(ends2),
+                    sort=True,
+                    max_gap=self.max_gap,
+                    max_block=self.max_block,
+                )
+                bytes_out = fs.cat_ranges(new_paths, new_starts, new_ends)
+            else:
+                new_paths, new_starts, new_ends, bytes_out = [], [], [], []
 
             # unbundle from merged bytes - simple approach
             for u, s, e, p in zip(urls, starts, ends, valid_paths):
@@ -1013,7 +1513,13 @@ class ReferenceFileSystem(AsyncFileSystem):
             # do not do this for lazy/parquet backend, which will not make dicts,
             # but must remain writable in the original object
             references = {
-                key: json.dumps(val) if isinstance(val, dict) else val
+                key: (
+                    _normalize_multi_segment_reference(val)
+                    if _is_multi_segment_reference(val)
+                    else json.dumps(val)
+                    if isinstance(val, dict)
+                    else val
+                )
                 for key, val in references.items()
             }
         self.references = references
@@ -1037,6 +1543,8 @@ class ReferenceFileSystem(AsyncFileSystem):
                 if v.startswith("base64:"):
                     self.references[k] = base64.b64decode(v[7:])
                 self.references[k] = v
+            elif _is_multi_segment_reference(v):
+                self.references[k] = _normalize_multi_segment_reference(v)
             elif isinstance(v, dict):
                 self.references[k] = json.dumps(v)
             elif self.templates:
@@ -1052,7 +1560,11 @@ class ReferenceFileSystem(AsyncFileSystem):
                         u = _render_jinja(u)
                 self.references[k] = [u] if len(v) == 1 else [u, v[1], v[2]]
             else:
-                self.references[k] = v
+                self.references[k] = (
+                    _normalize_multi_segment_reference(v)
+                    if _is_multi_segment_reference(v)
+                    else v
+                )
         self.references.update(self._process_gen(references.get("gen", [])))
 
     def _process_templates(self, tmp):
@@ -1128,6 +1640,27 @@ class ReferenceFileSystem(AsyncFileSystem):
         for path, part in it:
             if isinstance(part, (bytes, str)) or hasattr(part, "to_bytes"):
                 size = len(part)
+            elif _is_multi_segment_reference(part):
+                segments = _normalize_multi_segment_reference(part)["segments"]
+                size = 0
+                for index, segment in enumerate(segments):
+                    if segment["length"] is None:
+                        url = segment["url"]
+                        if url is None:
+                            url = self.target
+                        protocol, _ = split_protocol(url)
+                        try:
+                            target_size = self._sync_fs(protocol).size(url)
+                        except Exception as e:
+                            raise ReferenceNotReachable(path, url, index) from e
+                        segment_length = target_size - segment["offset"]
+                        if segment_length < 0:
+                            raise ReferenceLengthOverflow(
+                                path, index, url, 0, segment_length
+                            )
+                    else:
+                        segment_length = segment["length"]
+                    size += segment_length
             elif len(part) == 1:
                 size = None
             else:
@@ -1153,6 +1686,22 @@ class ReferenceFileSystem(AsyncFileSystem):
             self.dircache[par].append({"name": path, "type": "file", "size": size})
 
     def _open(self, path, mode="rb", block_size=None, cache_options=None, **kwargs):
+        path = self._strip_protocol(path)
+        part = self.references.get(path)
+        if _is_multi_segment_reference(part):
+            segments = _normalize_multi_segment_reference(part)["segments"]
+            segments = self._resolve_segments(path, segments)
+            size = sum(segment["length"] for segment in segments)
+            return MultiSegmentReferenceFile(
+                self,
+                path,
+                mode,
+                block_size=block_size,
+                cache_options=cache_options,
+                size=size,
+                **kwargs,
+            )
+
         part_or_url, start0, end0 = self._cat_common(path)
         # This logic is kept outside `ReferenceFile` to avoid unnecessary redirection.
         # That does mean `_cat_common` gets called twice if it eventually reaches `ReferenceFile`.
@@ -1161,7 +1710,10 @@ class ReferenceFileSystem(AsyncFileSystem):
 
         protocol, _ = split_protocol(part_or_url)
         if start0 is None and end0 is None:
-            return self.fss[protocol]._open(
+            remote_fs = self.fss[protocol]
+            if isinstance(remote_fs, AsyncFileSystemWrapper):
+                remote_fs = remote_fs.sync_fs
+            return remote_fs._open(
                 part_or_url,
                 mode,
                 block_size=block_size,
@@ -1196,6 +1748,18 @@ class ReferenceFileSystem(AsyncFileSystem):
             return out
         return [o["name"] for o in out]
 
+    def size(self, path):
+        return self.info(path)["size"]
+
+    def sizes(self, paths):
+        return [self.size(path) for path in paths]
+
+    def du(self, path, total=True, maxdepth=None, withdirs=False, **kwargs):
+        sizes = {}
+        for file_path in self.find(path, maxdepth=maxdepth, withdirs=withdirs):
+            sizes[file_path] = self.info(file_path)["size"]
+        return sum(sizes.values()) if total else sizes
+
     def exists(self, path, **kwargs):  # overwrite auto-sync version
         return self.isdir(path) or self.isfile(path)
 
@@ -1216,12 +1780,51 @@ class ReferenceFileSystem(AsyncFileSystem):
         return self.ls(path, detail, **kwargs)
 
     def find(self, path, maxdepth=None, withdirs=False, detail=False, **kwargs):
+        path = self._strip_protocol(path)
+        if withdirs and not isinstance(self.references, LazyReferenceMapper):
+            if not self.dircache:
+                self._dircache_from_items()
+
+            if path in self.references:
+                return {path: self.info(path)} if detail else [path]
+
+            prefix = f"{path}/" if path else ""
+            root_depth = path.count("/") + (1 if not path else 0)
+
+            def depth(name):
+                return name.count("/") - root_depth + 1
+
+            names = set(self.references)
+            if prefix:
+                names = {name for name in names if name.startswith(prefix)}
+            if maxdepth is not None:
+                names = {name for name in names if depth(name) <= maxdepth}
+
+            if withdirs:
+                dir_names = set(self.dircache)
+                if prefix:
+                    dir_names = {
+                        name for name in dir_names if name.startswith(prefix)
+                    }
+                else:
+                    dir_names.discard("")
+                if maxdepth is not None:
+                    dir_names = {
+                        name for name in dir_names if depth(name) <= maxdepth
+                    }
+                if path and path in self.dircache:
+                    dir_names.add(path)
+                names.update(dir_names)
+
+            if detail:
+                return {name: self.info(name) for name in sorted(names)}
+            return sorted(names)
+
         if withdirs:
             return super().find(
                 path, maxdepth=maxdepth, withdirs=withdirs, detail=detail, **kwargs
             )
         if path:
-            path = self._strip_protocol(path)
             r = sorted(k for k in self.references if k.startswith(path))
         else:
             r = sorted(self.references)
@@ -1232,12 +1835,30 @@ class ReferenceFileSystem(AsyncFileSystem):
         else:
             return r
 
+    def expand_path(
+        self, path, recursive=False, maxdepth=None, assume_literal=False, **kwargs
+    ):
+        return AbstractFileSystem.expand_path(
+            self,
+            path,
+            recursive=recursive,
+            maxdepth=maxdepth,
+            assume_literal=assume_literal,
+            **kwargs,
+        )
+
     def info(self, path, **kwargs):
         out = self.references.get(path)
         if out is not None:
             if isinstance(out, (str, bytes)):
                 # decode base64 here
                 return {"name": path, "type": "file", "size": len(out)}
+            if _is_multi_segment_reference(out):
+                return {
+                    "name": path,
+                    "type": "file",
+                    "size": self._multi_segment_size(path),
+                }
             elif len(out) > 1:
                 return {"name": path, "type": "file", "size": out[2]}
             else:
@@ -1250,11 +1871,17 @@ class ReferenceFileSystem(AsyncFileSystem):
         if out0[0]["size"] is None:
             # if this is a whole remote file, update size using remote FS
             prot, _ = split_protocol(self.references[path][0])
-            out0[0]["size"] = self.fss[prot].size(self.references[path][0])
+            out0[0]["size"] = self._sync_fs(prot).size(self.references[path][0])
         return out0[0]
 
     async def _info(self, path, **kwargs):
         out = self.references.get(path)
+        if _is_multi_segment_reference(out):
+            return {
+                "name": path,
+                "type": "file",
+                "size": self._multi_segment_size(path),
+            }
         if isinstance(out, (list, tuple)) and len(out) == 1:
             # whole remote file: the size must come from the remote FS, which
             # cannot be called synchronously from inside the event loop
@@ -1290,6 +1917,18 @@ class ReferenceFileSystem(AsyncFileSystem):
 
     def save_json(self, url, **storage_options):
         """Write modified references into new location"""
+        def jsonable(value):
+            if isinstance(value, bytes):
+                try:
+                    return value.decode("ascii")
+                except UnicodeDecodeError:
+                    return (b"base64:" + base64.b64encode(value)).decode()
+            if isinstance(value, dict):
+                return {key: jsonable(item) for key, item in value.items()}
+            if isinstance(value, (list, tuple)):
+                return [jsonable(item) for item in value]
+            return value
+
         out = {}
         for k, v in self.references.items():
             if isinstance(v, bytes):
@@ -1298,9 +1937,41 @@ class ReferenceFileSystem(AsyncFileSystem):
                 except UnicodeDecodeError:
                     out[k] = (b"base64:" + base64.b64encode(v)).decode()
             else:
-                out[k] = v
+                out[k] = jsonable(v)
         with fsspec.open(url, "wb", **storage_options) as f:
             f.write(json.dumps({"version": 1, "refs": out}).encode())
+
+
+class MultiSegmentReferenceFile(AbstractBufferedFile):
+    def __init__(
+        self,
+        fs,
+        path,
+        mode="rb",
+        block_size="default",
+        autocommit=True,
+        cache_type="none",
+        cache_options=None,
+        size=None,
+        **kwargs,
+    ):
+        super().__init__(
+            fs,
+            path,
+            mode=mode,
+            block_size=block_size,
+            autocommit=autocommit,
+            size=size,
+            cache_type="none",
+            cache_options=cache_options,
+            **kwargs,
+        )
+
+    def _fetch_range(self, start, end):
+        return self.fs.cat_file(self.path, start=start, end=end)
+
+    def read1(self, length=-1):
+        return self.read(length)
 
 
 class ReferenceFile(AbstractBufferedFile):
@@ -1330,6 +2001,8 @@ class ReferenceFile(AbstractBufferedFile):
         part_or_url, self.start, self.end = self.fs._cat_common(self.path)
         protocol, _ = split_protocol(part_or_url)
         self.src_fs = self.fs.fss[protocol]
+        if isinstance(self.src_fs, AsyncFileSystemWrapper):
+            self.src_fs = self.src_fs.sync_fs
         self.src_path = part_or_url
         self._f = None
 

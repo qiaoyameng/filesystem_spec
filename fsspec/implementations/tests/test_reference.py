@@ -7,6 +7,7 @@ import fsspec
 from fsspec.implementations.local import LocalFileSystem
 from fsspec.implementations.reference import (
     LazyReferenceMapper,
+    ReferenceLengthOverflow,
     ReferenceFileSystem,
     ReferenceNotReachable,
 )
@@ -81,6 +82,122 @@ def test_open(m):
         assert f.read(2) == data[1:3]
         f.seek(1, os.SEEK_CUR)
         assert f.read() == data[4:6]
+
+
+def test_multi_segment_cat_and_open(m, tmp_path, monkeypatch):
+    local_path = tmp_path / "local.bin"
+    local_path.write_bytes(b"ABCDEFGHIJ")
+    local_url = f"file://{local_path}"
+    m.pipe("remote.bin", b"0123456789")
+
+    local_fs = LocalFileSystem()
+    calls = []
+    original_local_cat = local_fs.cat_file
+    original_memory_cat = m.cat_file
+
+    def record(kind, cat_file, path, start=None, end=None, **kwargs):
+        calls.append((kind, path, start, end))
+        return cat_file(path, start=start, end=end, **kwargs)
+
+    monkeypatch.setattr(
+        local_fs,
+        "cat_file",
+        lambda path, start=None, end=None, **kwargs: record(
+            "local", original_local_cat, path, start, end, **kwargs
+        ),
+    )
+    monkeypatch.setattr(
+        m,
+        "cat_file",
+        lambda path, start=None, end=None, **kwargs: record(
+            "memory", original_memory_cat, path, start, end, **kwargs
+        ),
+    )
+
+    refs = {
+        "v": {
+            "segments": [
+                {"url": local_url, "offset": 1, "length": 4},
+                {"data": b"XY"},
+                {"zero": 3},
+                {"url": "memory://remote.bin", "offset": 6, "length": 4},
+            ]
+        }
+    }
+    fs = fsspec.filesystem(
+        "reference", fo=refs, fs={"file": local_fs, "memory": m}
+    )
+
+    assert fs.size("v") == 13
+    assert fs.cat(["v"])["v"] == b"BCDEXY\x00\x00\x006789"
+
+    calls.clear()
+    assert fs.cat_file("v") == b"BCDEXY\x00\x00\x006789"
+    assert calls == [
+        ("local", local_url, 1, 5),
+        ("memory", "memory://remote.bin", 6, 10),
+    ]
+
+    calls.clear()
+    assert fs.cat_file("v", start=2, end=11) == b"DEXY\x00\x00\x0067"
+    assert fs.cat_file("v", start=-4, end=-1) == b"678"
+    assert calls == [
+        ("local", local_url, 3, 5),
+        ("memory", "memory://remote.bin", 6, 8),
+        ("memory", "memory://remote.bin", 6, 9),
+    ]
+
+    calls.clear()
+    with fs.open("v", "rb") as f:
+        assert f.size == 13
+        assert f.seek(-4, os.SEEK_END) == 9
+        assert f.read() == b"6789"
+        assert f.seek(-6, os.SEEK_END) == 7
+        assert f.read(3) == b"\x00\x006"
+    assert calls == [
+        ("memory", "memory://remote.bin", 6, 10),
+        ("memory", "memory://remote.bin", 6, 7),
+    ]
+
+
+def test_multi_segment_v1_json_and_errors(m, tmp_path):
+    local_path = tmp_path / "local.bin"
+    local_path.write_bytes(b"ABCDEFGHIJ")
+    local_url = f"file://{local_path}"
+    m.pipe("short.bin", b"01")
+
+    refs = {
+        "version": 1,
+        "refs": {
+            "v": [
+                {"path": local_url, "offset": 1, "size": 4},
+                {"inline": "XY"},
+                2,
+                ("memory://short.bin", 0, 3),
+            ],
+            "missing": [
+                [local_url, 0, 1],
+                {"target": "memory://missing.bin", "offset": 0, "length": 2},
+            ],
+        },
+    }
+    fs = fsspec.filesystem(
+        "reference",
+        fo=refs,
+        fs={"file": LocalFileSystem(), "memory": m},
+    )
+    fs.save_json("memory://multi-segment-refs.json")
+    reloaded = fsspec.filesystem(
+        "reference",
+        fo="memory://multi-segment-refs.json",
+        fs={"file": LocalFileSystem(), "memory": m},
+    )
+    assert reloaded.cat_file("missing", start=0, end=1) == b"A"
+
+    with pytest.raises(ReferenceLengthOverflow, match="segment 3"):
+        fs.cat_file("v")
+    with pytest.raises(ReferenceNotReachable, match="segment 1"):
+        fs.cat_file("missing")
 
 
 def test_simple_ver1(server):
