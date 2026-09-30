@@ -74,6 +74,19 @@ From the user's point of view, this is achieved simply by passing arguments to
 the :func:`fsspec.open_files` or :func:`fsspec.open` functions, and
 thereafter happens transparently.
 
+With ``compression="infer"``, the codec is guessed from the filename suffix.
+For files without a known suffix, the leading bytes of the content are
+inspected instead: only the few "magic" bytes registered for each codec (see
+``fsspec.compression.register_compression``) are read, and they are pushed
+back onto the stream, so no payload is consumed and non-seekable streams
+remain readable. If the suffix and the content disagree, the
+``compression_policy`` argument (or the "compression_infer_policy" config
+value) decides what happens: "strict" (the default) raises, while "content"
+and "extension" trust the content and the suffix, respectively. Only a single
+layer of compression is removed by default; pass ``compression_max_layers``
+(or set the "compression_max_layers" config value) to unwrap nested
+compression.
+
 Key-value stores
 ----------------
 
