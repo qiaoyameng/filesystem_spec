@@ -1,5 +1,6 @@
 import json
 import os
+from unittest import mock
 
 import pytest
 
@@ -9,6 +10,7 @@ from fsspec.implementations.reference import (
     LazyReferenceMapper,
     ReferenceFileSystem,
     ReferenceNotReachable,
+    ReferenceSegmentOverflow,
 )
 from fsspec.tests.conftest import data, reset_files, server, win  # noqa: F401
 
@@ -1049,3 +1051,134 @@ def test_no_default_jinja_execution():
 
     with pytest.raises(ZeroDivisionError):
         fsspec.filesystem("reference", fo=manifest, simple_templates=False)
+
+
+def _make_concat_fs(m, tmp_path):
+    """A reference FS whose virtual file joins memory, inline, zero-fill and
+    local-file segments."""
+    mem_data = b"memory-target-bytes"
+    m.pipe("/mem.bin", mem_data)
+    local_data = b"LOCALFILEDATA0123456789"
+    local_file = str(tmp_path / "local.bin")
+    with open(local_file, "wb") as f:
+        f.write(local_data)
+
+    refs = {
+        "virt": [
+            ["memory://mem.bin", 3, 6],  # remote range, memory backend
+            b"INLINE",  # inline bytes
+            {"zeros": 4},  # explicit zero fill
+            [local_file, 2, 8],  # remote range, local file backend
+        ],
+    }
+    fs = fsspec.filesystem("reference", fo=refs, fs={"memory": m})
+    expected = mem_data[3:9] + b"INLINE" + b"\x00" * 4 + local_data[2:10]
+    return fs, expected
+
+
+def test_concat_references(m, tmp_path):
+    fs, expected = _make_concat_fs(m, tmp_path)
+
+    assert fs.cat_file("virt") == expected
+    assert fs.cat("virt") == expected
+    assert fs.info("virt")["size"] == len(expected)
+    assert fs.ls("", detail=False) == ["virt"]
+    assert fs.ls("")[0]["size"] == len(expected)
+
+
+def test_concat_cat_file_ranges(m, tmp_path):
+    fs, expected = _make_concat_fs(m, tmp_path)
+
+    # ranges are in virtual file offsets
+    assert fs.cat_file("virt", start=2) == expected[2:]
+    assert fs.cat_file("virt", end=10) == expected[:10]
+    # from the middle of the first segment into the third (zero-fill) segment
+    assert fs.cat_file("virt", start=2, end=14) == expected[2:14]
+    # negative offsets resolve against the end of the virtual file
+    assert fs.cat_file("virt", start=-6) == expected[-6:]
+    assert fs.cat_file("virt", 3, -2) == expected[3:-2]
+    # out-of-range offsets clamp like slicing
+    assert fs.cat_file("virt", start=1000) == b""
+    assert fs.cat_file("virt", end=1000) == expected
+
+
+def test_concat_fetches_only_involved_ranges(m, tmp_path):
+    fs, expected = _make_concat_fs(m, tmp_path)
+
+    # read from the middle of the first segment into the third segment:
+    # only the overlapping part of the memory target is fetched, and the
+    # local file segment is not touched at all
+    with mock.patch.object(m, "cat_file", wraps=m.cat_file) as spy:
+        out = fs.cat_file("virt", start=2, end=14)
+    assert out == expected[2:14]
+    assert spy.call_count == 1
+    assert spy.call_args.kwargs["start"] == 3 + 2  # segment offset + overlap
+    assert spy.call_args.kwargs["end"] == 3 + 6
+
+
+def test_concat_open_read_seek(m, tmp_path):
+    fs, expected = _make_concat_fs(m, tmp_path)
+
+    with fs.open("virt", "rb") as f:
+        assert f.read() == expected
+
+    with fs.open("virt", "rb") as f:
+        # from the middle of the first segment into the third segment
+        f.seek(2)
+        assert f.read(12) == expected[2:14]
+        # negative seek from the end of the virtual file
+        assert f.seek(-5, 2) == len(expected) - 5
+        assert f.read() == expected[-5:]
+        # negative relative seek
+        f.seek(10)
+        f.seek(-4, 1)
+        assert f.read(4) == expected[6:10]
+        with pytest.raises(ValueError, match="before start"):
+            f.seek(-len(expected) - 1, 2)
+
+
+def test_concat_missing_target_names_segment(m):
+    m.pipe("/ok", b"0123456789")
+    fs = fsspec.filesystem(
+        "reference",
+        fo={"virt": [b"inline", ["memory://missing", 0, 4], {"zeros": 2}]},
+        fs={"memory": m},
+    )
+    with pytest.raises(ReferenceNotReachable) as excinfo:
+        fs.cat_file("virt")
+    assert excinfo.value.segment == 1
+    assert "segment 1" in str(excinfo.value)
+    assert "memory://missing" in str(excinfo.value)
+
+
+def test_concat_length_overflow_names_segment(m):
+    m.pipe("/short", b"abc")
+    fs = fsspec.filesystem(
+        "reference",
+        # segment 1 declares 10 bytes but the target only has 3
+        fo={"virt": [b"xy", ["memory://short", 0, 10], {"zeros": 2}]},
+        fs={"memory": m},
+    )
+    with pytest.raises(ReferenceSegmentOverflow) as excinfo:
+        fs.cat_file("virt")
+    assert excinfo.value.segment == 1
+    assert "segment 1" in str(excinfo.value)
+
+
+def test_concat_spec_v1(m):
+    m.pipe("/a", b"0123456789")
+    refs = {
+        "version": 1,
+        "refs": {
+            "virt": [
+                ["memory://a", 2, 3],
+                {"zeros": 2},
+                {"data": "base64:aGk="},
+            ],
+            "classic": ["memory://a", 0, 4],
+        },
+    }
+    fs = fsspec.filesystem("reference", fo=refs, fs={"memory": m})
+    assert fs.cat_file("virt") == b"234" + b"\x00" * 2 + b"hi"
+    # classic reference forms still work alongside
+    assert fs.cat_file("classic") == b"0123"

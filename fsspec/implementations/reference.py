@@ -33,13 +33,36 @@ logger = logging.getLogger("fsspec.reference")
 
 
 class ReferenceNotReachable(RuntimeError):
-    def __init__(self, reference, target, *args):
+    def __init__(self, reference, target, *args, segment=None):
         super().__init__(*args)
         self.reference = reference
         self.target = target
+        self.segment = segment
 
     def __str__(self):
-        return f'Reference "{self.reference}" failed to fetch target {self.target}'
+        seg = f" (segment {self.segment})" if self.segment is not None else ""
+        return f'Reference "{self.reference}" failed to fetch target {self.target}{seg}'
+
+
+class ReferenceSegmentOverflow(ValueError):
+    """A segment of a concatenated reference declares more bytes than its
+    target can provide."""
+
+    def __init__(self, reference, segment, target, expected, received):
+        super().__init__()
+        self.reference = reference
+        self.segment = segment
+        self.target = target
+        self.expected = expected
+        self.received = received
+
+    def __str__(self):
+        return (
+            f'Reference "{self.reference}" segment {self.segment} '
+            f"({self.target}): expected {self.expected} bytes but the target "
+            f"only provided {self.received}; the declared reference length "
+            "overflows the target"
+        )
 
 
 def _first(d):
@@ -60,6 +83,35 @@ def _protocol_groups(paths, references):
         protocol = _prot_in_references(path, references)
         out.setdefault(protocol, []).append(path)
     return out
+
+
+def _is_concat_ref(part):
+    """Whether a reference value is a concatenated multi-segment reference.
+
+    Such references are lists of segments, where each segment is one of:
+    a (url, offset, size) list/tuple, a dict ({"zeros": n} or {"data": ...}),
+    or inline bytes. This is distinct from the classic (url,) and
+    (url, offset, size) forms, whose first element is a string or None.
+    """
+    return isinstance(part, (list, tuple)) and (
+        len(part) == 0 or isinstance(part[0], (list, tuple, bytes, dict))
+    )
+
+
+class _ConcatRef:
+    """A concatenated reference resolved into virtual-offset space.
+
+    segments: list of (kind, payload, vstart, vend) tuples, where kind is
+    "remote" (payload is (url, offset, size)), "data" (payload is bytes) or
+    "zeros" (payload is the fill length). [vstart, vend) is the segment's
+    range within the virtual file.
+    """
+
+    __slots__ = ("segments", "size")
+
+    def __init__(self, segments, size):
+        self.segments = segments
+        self.size = size
 
 
 class RefsValuesView(collections.abc.ValuesView):
@@ -615,6 +667,16 @@ class ReferenceFileSystem(AsyncFileSystem):
     can also contain concrete data for some set of paths.
     Reference dict format:
     {path0: bytes_data, path1: (target_url, offset, size)}
+
+    A reference may also be a concatenation of segments, forming a virtual
+    file whose offsets span the joined parts:
+    {path2: [(target_url, offset, size), b"inline bytes", {"zeros": 1024},
+             (other_url, 0, 100)]}
+    where each segment is a (url, offset, size) remote byte range, inline
+    bytes (or a {"data": ...} dict, base64-decoded if prefixed "base64:"),
+    or an explicit zero-fill run {"zeros": length}. Reads and seeks use
+    virtual file offsets, and only the physical ranges overlapping a
+    requested range are fetched.
     https://github.com/fsspec/kerchunk/blob/main/README.md
 
     simple_references: if True (default), no jinja interpreting is done,
@@ -804,6 +866,22 @@ class ReferenceFileSystem(AsyncFileSystem):
                 part = base64.b64decode(part[7:])
             return part, None, None
 
+        if _is_concat_ref(part):
+            view = self._concat_segments(path, part)
+            logger.debug(f"Reference: {path}, {len(view.segments)} segments")
+            total = view.size
+            # Resolve offsets like slicing the virtual file, so they never
+            # reach target bytes outside the concatenated length.
+            if start is not None:
+                start1 = min(start, total) if start >= 0 else max(total + start, 0)
+            else:
+                start1 = 0
+            if end is not None:
+                end1 = min(end, total) if end >= 0 else max(total + end, 0)
+            else:
+                end1 = total
+            return view, start1, end1
+
         if len(part) == 1:
             logger.debug(f"Reference: {path}, whole file => {part}")
             url = part[0]
@@ -833,10 +911,129 @@ class ReferenceFileSystem(AsyncFileSystem):
             url = self.target
         return url, start1, end1
 
+    def _concat_segments(self, path, part):
+        """Resolve a concatenated reference into virtual-offset segments"""
+        segments = []
+        pos = 0
+        for i, seg in enumerate(part):
+            if isinstance(seg, (list, tuple)):
+                if len(seg) != 3:
+                    raise ValueError(
+                        f'Reference "{path}" segment {i}: remote segments must '
+                        f"be (url, offset, size), got {seg!r}"
+                    )
+                url, offset, size = seg
+                if url is None:
+                    url = self.target
+                if url is None:
+                    raise ValueError(
+                        f'Reference "{path}" segment {i}: no url given and no '
+                        "default target is set"
+                    )
+                offset, size = int(offset), int(size)
+                if offset < 0 or size < 0:
+                    raise ValueError(
+                        f'Reference "{path}" segment {i}: offset and size must '
+                        f"be non-negative, got {seg!r}"
+                    )
+                segments.append(("remote", (url, offset, size), pos, pos + size))
+                pos += size
+            elif isinstance(seg, dict):
+                if "zeros" in seg:
+                    n = int(seg["zeros"])
+                    if n < 0:
+                        raise ValueError(
+                            f'Reference "{path}" segment {i}: zero-fill length '
+                            f"must be non-negative, got {seg!r}"
+                        )
+                    segments.append(("zeros", n, pos, pos + n))
+                    pos += n
+                elif "data" in seg:
+                    data = self._inline_data(seg["data"])
+                    segments.append(("data", data, pos, pos + len(data)))
+                    pos += len(data)
+                else:
+                    raise ValueError(
+                        f'Reference "{path}" segment {i}: unknown segment {seg!r}'
+                    )
+            elif isinstance(seg, (bytes, str)):
+                data = self._inline_data(seg)
+                segments.append(("data", data, pos, pos + len(data)))
+                pos += len(data)
+            else:
+                raise ValueError(
+                    f'Reference "{path}" segment {i}: cannot interpret {seg!r}'
+                )
+        return _ConcatRef(segments, pos)
+
+    @staticmethod
+    def _inline_data(value):
+        data = value.encode() if isinstance(value, str) else bytes(value)
+        if data.startswith(b"base64:"):
+            data = base64.b64decode(data[7:])
+        return data
+
+    @staticmethod
+    def _concat_pieces(view, start, end):
+        """The (segment index, segment, overlap) involved in a virtual range"""
+        for i, (kind, payload, vs, ve) in enumerate(view.segments):
+            if ve <= start or vs >= end:
+                continue
+            yield i, kind, payload, vs, max(start, vs), min(end, ve)
+
+    def _cat_concat(self, path, view, start, end):
+        """Fetch a virtual range of a concatenated reference.
+
+        Only the physical ranges overlapping [start, end) are fetched.
+        """
+        parts = []
+        for i, kind, payload, vs, s, e in self._concat_pieces(view, start, end):
+            if kind == "data":
+                parts.append(payload[s - vs : e - vs])
+            elif kind == "zeros":
+                parts.append(b"\x00" * (e - s))
+            else:
+                url, offset, _ = payload
+                protocol, _ = split_protocol(url)
+                try:
+                    chunk = self.fss[protocol].cat_file(
+                        url, start=offset + s - vs, end=offset + e - vs
+                    )
+                except Exception as exc:
+                    raise ReferenceNotReachable(path, url, segment=i) from exc
+                if len(chunk) != e - s:
+                    raise ReferenceSegmentOverflow(path, i, url, e - s, len(chunk))
+                parts.append(chunk)
+        return b"".join(parts)
+
+    async def _cat_concat_async(self, path, view, start, end):
+        """Async version of _cat_concat"""
+        parts = []
+        for i, kind, payload, vs, s, e in self._concat_pieces(view, start, end):
+            if kind == "data":
+                parts.append(payload[s - vs : e - vs])
+            elif kind == "zeros":
+                parts.append(b"\x00" * (e - s))
+            else:
+                url, offset, _ = payload
+                protocol, _ = split_protocol(url)
+                try:
+                    chunk = await self.fss[protocol]._cat_file(
+                        url, start=offset + s - vs, end=offset + e - vs
+                    )
+                except Exception as exc:
+                    raise ReferenceNotReachable(path, url, segment=i) from exc
+                if len(chunk) != e - s:
+                    raise ReferenceSegmentOverflow(path, i, url, e - s, len(chunk))
+                parts.append(chunk)
+        return b"".join(parts)
+
     async def _cat_file(self, path, start=None, end=None, **kwargs):
         part_or_url, start0, end0 = self._cat_common(path, start=start, end=end)
         if isinstance(part_or_url, bytes):
             return part_or_url[start:end]
+        if isinstance(part_or_url, _ConcatRef):
+            return await self._cat_concat_async(path, part_or_url, start0, end0)
         protocol, _ = split_protocol(part_or_url)
         try:
             return await self.fss[protocol]._cat_file(
@@ -849,6 +1046,8 @@ class ReferenceFileSystem(AsyncFileSystem):
         part_or_url, start0, end0 = self._cat_common(path, start=start, end=end)
         if isinstance(part_or_url, bytes):
             return part_or_url[start:end]
+        if isinstance(part_or_url, _ConcatRef):
+            return self._cat_concat(path, part_or_url, start0, end0)
         protocol, _ = split_protocol(part_or_url)
         try:
             return self.fss[protocol].cat_file(part_or_url, start=start0, end=end0)
@@ -914,6 +1113,10 @@ class ReferenceFileSystem(AsyncFileSystem):
                 # found and on_error is "raise"
                 try:
                     u, s, e = self._cat_common(p)
+                    if isinstance(u, _ConcatRef):
+                        # concatenated reference: fetch involved segments only
+                        out[p] = self._cat_concat(p, u, s, e)
+                        continue
                     if not isinstance(u, (bytes, str)):
                         # nan/None from parquet
                         continue
@@ -1039,6 +1242,10 @@ class ReferenceFileSystem(AsyncFileSystem):
                 self.references[k] = v
             elif isinstance(v, dict):
                 self.references[k] = json.dumps(v)
+            elif _is_concat_ref(v):
+                # concatenated multi-segment reference; kept as-is (template
+                # processing does not descend into segments)
+                self.references[k] = v
             elif self.templates:
                 u = v[0]
                 if "{{" in u:
@@ -1128,6 +1335,8 @@ class ReferenceFileSystem(AsyncFileSystem):
         for path, part in it:
             if isinstance(part, (bytes, str)) or hasattr(part, "to_bytes"):
                 size = len(part)
+            elif _is_concat_ref(part):
+                size = self._concat_segments(path, part).size
             elif len(part) == 1:
                 size = None
             else:
@@ -1158,6 +1367,16 @@ class ReferenceFileSystem(AsyncFileSystem):
         # That does mean `_cat_common` gets called twice if it eventually reaches `ReferenceFile`.
         if isinstance(part_or_url, bytes):
             return io.BytesIO(part_or_url[start0:end0])
+
+        if isinstance(part_or_url, _ConcatRef):
+            return ConcatReferenceFile(
+                self,
+                path,
+                mode,
+                block_size=block_size,
+                cache_options=cache_options,
+                **kwargs,
+            )
 
         protocol, _ = split_protocol(part_or_url)
         if start0 is None and end0 is None:
@@ -1238,6 +1457,9 @@ class ReferenceFileSystem(AsyncFileSystem):
             if isinstance(out, (str, bytes)):
                 # decode base64 here
                 return {"name": path, "type": "file", "size": len(out)}
+            elif _is_concat_ref(out):
+                size = self._concat_segments(path, out).size
+                return {"name": path, "type": "file", "size": size}
             elif len(out) > 1:
                 return {"name": path, "type": "file", "size": out[2]}
             else:
@@ -1255,6 +1477,8 @@ class ReferenceFileSystem(AsyncFileSystem):
 
     async def _info(self, path, **kwargs):
         out = self.references.get(path)
+        if out is not None and _is_concat_ref(out):
+            return self.info(path)  # calls fast sync code
         if isinstance(out, (list, tuple)) and len(out) == 1:
             # whole remote file: the size must come from the remote FS, which
             # cannot be called synchronously from inside the event loop
@@ -1356,3 +1580,42 @@ class ReferenceFile(AbstractBufferedFile):
         end = min(end + self.start, self.end)
         self.f.seek(start)
         return self.f.read(end - start)
+
+
+class ConcatReferenceFile(AbstractBufferedFile):
+    """File-like view over a concatenated multi-segment reference.
+
+    All offsets (read, seek) are in the virtual file's coordinate space;
+    only the physical ranges overlapping a requested range are fetched.
+    """
+
+    def __init__(
+        self,
+        fs,
+        path,
+        mode="rb",
+        block_size="default",
+        autocommit=True,
+        cache_type="readahead",
+        cache_options=None,
+        **kwargs,
+    ):
+        view, _, _ = fs._cat_common(path)
+        self._view = view
+        super().__init__(
+            fs,
+            path,
+            mode=mode,
+            block_size=block_size,
+            autocommit=autocommit,
+            size=view.size,
+            cache_type=cache_type,
+            cache_options=cache_options,
+            **kwargs,
+        )
+
+    def _fetch_range(self, start, end):
+        end = min(end, self.size)
+        if start >= end:
+            return b""
+        return self.fs._cat_concat(self.path, self._view, start, end)
