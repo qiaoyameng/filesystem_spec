@@ -2,7 +2,13 @@ from . import caching
 from .callbacks import Callback
 from .compression import available_compressions
 from .core import get_fs_token_paths, open, open_files, open_local, url_to_fs
-from .exceptions import FSTimeoutError
+from .exceptions import (
+    ChangesetCollisionError,
+    ChangesetConflictError,
+    ChangesetError,
+    ChangesetUnsupportedError,
+    FSTimeoutError,
+)
 from .mapping import FSMap, get_mapper
 from .registry import (
     available_protocols,
@@ -20,6 +26,10 @@ except ImportError:
 
 __all__ = [
     "AbstractFileSystem",
+    "ChangesetCollisionError",
+    "ChangesetConflictError",
+    "ChangesetError",
+    "ChangesetUnsupportedError",
     "FSTimeoutError",
     "FSMap",
     "filesystem",

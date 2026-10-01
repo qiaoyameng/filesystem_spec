@@ -5,8 +5,15 @@ import uuid
 import warnings
 from collections.abc import MutableMapping
 from functools import cached_property
+from itertools import chain, repeat
 
 from fsspec.core import url_to_fs
+from fsspec.exceptions import (
+    ChangesetCollisionError,
+    ChangesetConflictError,
+    ChangesetError,
+    ChangesetUnsupportedError,
+)
 
 logger = logging.getLogger("fsspec.mapping")
 _MISSING = object()
@@ -133,6 +140,120 @@ class FSMap(MutableMapping):
     def delitems(self, keys):
         """Remove multiple keys from the store"""
         self.fs.rm([self._key_to_str(k) for k in keys])
+
+    def get_versions(self, keys):
+        """Fetch opaque version tokens for the given keys
+
+        A token changes every time the key is written or deleted, so tokens
+        obtained here can be passed as ``expected_versions`` to
+        ``apply_changeset`` to ensure a key still has the version it had
+        when it was read. The token of a missing key compares unequal to
+        the token of any existing key.
+
+        Parameters
+        ----------
+        keys: iterable of str
+
+        Returns
+        -------
+        dict(key, token)
+        """
+        return {key: self.fs.get_version(self._key_to_str(key)) for key in keys}
+
+    def apply_changeset(self, changes, expected_versions=None, *, atomic=True):
+        """Commit several writes and deletes as one changeset
+
+        Parameters
+        ----------
+        changes: dict(str, bytes | None)
+            Maps each key to the value to write, or None to delete the key.
+            Deleting a key that does not exist is a no-op.
+        expected_versions: dict(str, token), optional
+            Preconditions: for each key, the current version token (see
+            ``get_versions``) must equal the given one. If any precondition
+            fails, nothing is applied and ``ChangesetConflictError`` is
+            raised with the mismatches in its ``conflicts`` attribute; a
+            retry with the same stale token fails again rather than
+            silently overwriting the newer value.
+        atomic: bool
+            If True (default), the whole changeset must become visible as a
+            single all-or-nothing change. Backends that cannot provide this
+            raise ``ChangesetUnsupportedError`` and apply nothing. If
+            False, entries are applied sequentially on a best-effort basis.
+
+        Returns
+        -------
+        dict(str, str)
+            Maps each key in ``changes`` to its outcome, "applied" on
+            success.
+
+        Raises
+        ------
+        ChangesetCollisionError
+            Two different keys normalize to the same backend path; nothing
+            was applied.
+        ChangesetUnsupportedError
+            The backend cannot honour the requested semantics (e.g. atomic
+            mode on a backend without transaction support); nothing was
+            applied.
+        ChangesetConflictError
+            A precondition version did not match; nothing was applied.
+        ChangesetError
+            Application failed partway (only possible with
+            ``atomic=False``). Its ``statuses`` attribute reports which
+            keys are known to be "applied", "failed", "skipped" or
+            "unknown".
+        """
+        changes = dict(changes)
+        expected_versions = dict(expected_versions or {})
+        path_changes = {}
+        path_expected = {}
+        seen = {}
+        collisions = {}
+        for key, is_change in chain(
+            zip(changes, repeat(True)), zip(expected_versions, repeat(False))
+        ):
+            path = self._key_to_str(key)
+            if path in seen:
+                if seen[path] != key:
+                    collisions.setdefault(path, [seen[path]]).append(key)
+            else:
+                seen[path] = key
+            if is_change:
+                value = changes[key]
+                path_changes[path] = None if value is None else maybe_convert(value)
+            else:
+                path_expected[path] = expected_versions[key]
+        if collisions:
+            raise ChangesetCollisionError(
+                "changeset keys collide after normalization: "
+                + ", ".join(sorted(collisions)),
+                statuses={key: "skipped" for key in changes},
+                collisions=collisions,
+            )
+        if atomic and not getattr(self.fs, "supports_atomic_changeset", False):
+            raise ChangesetUnsupportedError(
+                f"{type(self.fs).__name__} does not support atomic changesets; "
+                "pass atomic=False for best-effort sequential application",
+                statuses={key: "skipped" for key in changes},
+            )
+        try:
+            statuses = self.fs.apply_changeset(
+                path_changes, path_expected, atomic=atomic
+            )
+        except ChangesetError as exc:
+            # Report outcomes in terms of mapper keys, not backend paths
+            exc.statuses = {
+                self._str_to_key(path): status
+                for path, status in exc.statuses.items()
+            }
+            if isinstance(exc, ChangesetConflictError):
+                exc.conflicts = {
+                    self._str_to_key(path): conflict
+                    for path, conflict in exc.conflicts.items()
+                }
+            raise
+        return {self._str_to_key(path): status for path, status in statuses.items()}
 
     def _key_to_str(self, key):
         """Generate full path for the key"""

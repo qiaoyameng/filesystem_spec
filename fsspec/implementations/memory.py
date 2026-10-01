@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import itertools
 import logging
+import threading
 from datetime import datetime, timezone
 from errno import ENOTEMPTY
 from io import BytesIO
@@ -8,6 +10,7 @@ from pathlib import PurePath, PureWindowsPath
 from typing import Any
 
 from fsspec import AbstractFileSystem
+from fsspec.exceptions import ChangesetConflictError, ChangesetError
 from fsspec.implementations.local import LocalFileSystem
 from fsspec.utils import stringify_path, tokenize
 
@@ -26,6 +29,14 @@ class MemoryFileSystem(AbstractFileSystem):
     pseudo_dirs = [""]  # shared by default
     protocol = "memory"
     root_marker = "/"
+    supports_atomic_changeset = True
+    # Guards check-and-apply of changesets; shared by all instances so that
+    # the default global store is also protected across instances.
+    _changeset_lock = threading.RLock()
+    # Per-path mutation counters backing get_version(); shared by default,
+    # exactly like ``store``.
+    _versions: dict[str, int] = {}
+    _version_counter = itertools.count(1)
 
     def __init__(self, *args, global_store=True, **kwargs):
         """Create a memory filesystem.
@@ -45,6 +56,7 @@ class MemoryFileSystem(AbstractFileSystem):
         if not global_store:
             self.store = {}
             self.pseudo_dirs = [""]
+            self._versions = {}
 
     @property
     def _fs_token(self):
@@ -63,8 +75,80 @@ class MemoryFileSystem(AbstractFileSystem):
         return (
             factory,
             (cls, args, kwargs),
-            {"store": self.store, "pseudo_dirs": self.pseudo_dirs},
+            {
+                "store": self.store,
+                "pseudo_dirs": self.pseudo_dirs,
+                "_versions": self._versions,
+            },
         )
+
+    def _record_mutation(self, path):
+        """Bump the version token of ``path`` following a write or delete"""
+        self._versions[path] = next(self._version_counter)
+
+    def get_version(self, path):
+        """Opaque token changing on every write/delete of ``path``
+
+        The token is ``(exists, counter)``: it differs between an existing
+        file and a missing path, and the counter changes on every mutation,
+        so a delete followed by a re-create never compares equal to an
+        older token.
+        """
+        path = self._strip_protocol(path)
+        return (path in self.store, self._versions.get(path, 0))
+
+    def apply_changeset(self, changes, expected_versions=None, *, atomic=True):
+        """Apply writes (bytes values) and deletes (None values) together
+
+        Preconditions are checked and the changes applied while holding the
+        filesystem-wide changeset lock, so with ``atomic=True`` (the
+        default) the whole changeset becomes visible as a single
+        all-or-nothing change: a failure partway restores the previous
+        state. With ``atomic=False`` entries are applied sequentially.
+        """
+        with self._changeset_lock:
+            conflicts = self._check_changeset_preconditions(expected_versions)
+            if conflicts:
+                raise ChangesetConflictError(
+                    f"changeset preconditions failed for {len(conflicts)} path(s)",
+                    statuses={path: "skipped" for path in changes},
+                    conflicts=conflicts,
+                )
+            if not atomic:
+                return super().apply_changeset(changes, None, atomic=False)
+            snapshot = {}
+            paths = list(changes)
+            for path in paths:
+                value = changes[path]
+                if path not in snapshot:
+                    # MemoryFile entries are replaced, never mutated in place,
+                    # so keeping the reference is a valid snapshot; None marks
+                    # "did not exist".
+                    snapshot[path] = self.store.get(path)
+                try:
+                    if value is None:
+                        if path in self.store:
+                            del self.store[path]
+                            self._record_mutation(path)
+                    else:
+                        self.pipe_file(path, value)
+                except Exception as exc:
+                    # Roll back every entry touched so far: an atomic
+                    # changeset must not leave a partial state behind.
+                    for spath, previous in snapshot.items():
+                        if previous is None:
+                            self.store.pop(spath, None)
+                        else:
+                            self.store[spath] = previous
+                        self._record_mutation(spath)
+                    # After rollback nothing took effect: every entry except
+                    # the failed one is reported as "skipped".
+                    statuses = {p: "skipped" for p in paths}
+                    statuses[path] = "failed"
+                    raise ChangesetError(
+                        f"changeset failed at {path!r}: {exc}", statuses=statuses
+                    ) from exc
+            return {p: "applied" for p in paths}
 
     @classmethod
     def _strip_protocol(cls, path):
@@ -339,6 +423,7 @@ class MemoryFileSystem(AbstractFileSystem):
             self.store[path2] = MemoryFile(
                 self, path2, self.store[path1].getvalue()
             )  # implicit copy
+            self._record_mutation(path2)
         elif self.isdir(path1):
             if path2 not in self.pseudo_dirs:
                 self.pseudo_dirs.append(path2)
@@ -357,6 +442,7 @@ class MemoryFileSystem(AbstractFileSystem):
         path = self._strip_protocol(path)
         try:
             del self.store[path]
+            self._record_mutation(path)
         except KeyError as e:
             raise FileNotFoundError(path) from e
 
@@ -435,4 +521,5 @@ class MemoryFile(BytesIO):
 
     def commit(self):
         self.fs.store[self.path] = self
+        self.fs._record_mutation(self.path)
         self.modified = datetime.now(tz=timezone.utc)

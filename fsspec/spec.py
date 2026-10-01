@@ -15,6 +15,11 @@ from typing import Any
 from .callbacks import DEFAULT_CALLBACK
 from .config import apply_config, conf
 from .dircache import DirCache
+from .exceptions import (
+    ChangesetConflictError,
+    ChangesetError,
+    ChangesetUnsupportedError,
+)
 from .transaction import Transaction
 from .utils import (
     _unstrip_protocol,
@@ -917,6 +922,102 @@ class AbstractFileSystem(metaclass=_Cached):
                 self.pipe_file(self._strip_protocol(k), v, **kwargs)
         else:
             raise ValueError("path must be str or dict")
+
+    #: Whether this backend can commit a changeset as a single visible
+    #: (all-or-nothing) change, including precondition checks. Backends that
+    #: cannot must leave this False; ``apply_changeset(atomic=True)`` then
+    #: raises ``ChangesetUnsupportedError`` rather than pretending success.
+    supports_atomic_changeset = False
+
+    def get_version(self, path):
+        """Return an opaque token identifying the current version of a path
+
+        The token changes every time the path is written or deleted, and
+        comparing two tokens with ``==`` tells whether the path changed in
+        between. The token for a path that does not exist must compare
+        unequal to the token of any existing file. Tokens are only
+        meaningful within one filesystem instance.
+
+        Used together with ``apply_changeset`` preconditions to implement
+        compare-and-swap style updates.
+        """
+        raise ChangesetUnsupportedError(
+            f"{type(self).__name__} does not support version tokens"
+        )
+
+    def apply_changeset(self, changes, expected_versions=None, *, atomic=True):
+        """Apply a set of writes and deletes, guarded by version preconditions
+
+        Parameters
+        ----------
+        changes: dict(str, bytes | None)
+            Maps each path to the bytes to write, or None to delete the
+            path. Deleting a path that does not exist is a no-op.
+        expected_versions: dict(str, token), optional
+            Preconditions: for each path, the current ``get_version`` token
+            must equal the given one (as obtained when the value was read).
+            If any precondition fails, nothing is applied and
+            ``ChangesetConflictError`` is raised, so retrying with a stale
+            token can never silently overwrite a newer value.
+        atomic: bool
+            If True (default), require the whole changeset to become visible
+            as a single all-or-nothing change. Backends that cannot provide
+            this raise ``ChangesetUnsupportedError`` and apply nothing. If
+            False, entries are applied sequentially on a best-effort basis.
+
+        Returns
+        -------
+        dict(str, str)
+            Maps each path in ``changes`` to its outcome, "applied" on
+            success. On failure a ``ChangesetError`` is raised whose
+            ``statuses`` attribute reports which entries are known to be
+            "applied", "failed", "skipped" or "unknown".
+        """
+        if atomic:
+            raise ChangesetUnsupportedError(
+                f"{type(self).__name__} does not support atomic changesets; "
+                "pass atomic=False for best-effort sequential application"
+            )
+        conflicts = self._check_changeset_preconditions(expected_versions)
+        if conflicts:
+            raise ChangesetConflictError(
+                f"changeset preconditions failed for {len(conflicts)} path(s)",
+                statuses={path: "skipped" for path in changes},
+                conflicts=conflicts,
+            )
+        statuses = {}
+        paths = list(changes)
+        for i, path in enumerate(paths):
+            value = changes[path]
+            try:
+                if value is None:
+                    try:
+                        self.rm_file(path)
+                    except FileNotFoundError:
+                        pass
+                else:
+                    self.pipe_file(path, value)
+            except Exception as exc:
+                statuses[path] = "failed"
+                statuses.update({p: "skipped" for p in paths[i + 1 :]})
+                raise ChangesetError(
+                    f"changeset failed at {path!r}: {exc}", statuses=statuses
+                ) from exc
+            statuses[path] = "applied"
+        return statuses
+
+    def _check_changeset_preconditions(self, expected_versions):
+        """Compare expected version tokens with current ones
+
+        Returns a dict of ``{path: {"expected": ..., "actual": ...}}`` for
+        every mismatch; empty means all preconditions hold.
+        """
+        conflicts = {}
+        for path, expected in (expected_versions or {}).items():
+            actual = self.get_version(path)
+            if actual != expected:
+                conflicts[path] = {"expected": expected, "actual": actual}
+        return conflicts
 
     def cat_ranges(
         self, paths, starts, ends, max_gap=None, on_error="return", **kwargs
