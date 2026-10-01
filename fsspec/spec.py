@@ -15,6 +15,7 @@ from typing import Any
 from .callbacks import DEFAULT_CALLBACK
 from .config import apply_config, conf
 from .dircache import DirCache
+from .exceptions import ChangeSetUnsupported
 from .transaction import Transaction
 from .utils import (
     _unstrip_protocol,
@@ -168,6 +169,7 @@ class AbstractFileSystem(metaclass=_Cached):
     mirror_sync_methods = False
     root_marker = ""  # For some FSs, may require leading '/' or other character
     transaction_type = Transaction
+    supports_atomic_changesets = False
 
     #: Extra *class attributes* that should be considered when hashing.
     _extra_tokenize_attributes = ()
@@ -917,6 +919,28 @@ class AbstractFileSystem(metaclass=_Cached):
                 self.pipe_file(self._strip_protocol(k), v, **kwargs)
         else:
             raise ValueError("path must be str or dict")
+
+    def commit_changeset(self, writes=None, deletes=(), preconditions=None):
+        """Commit a conditional batch of writes and deletes atomically.
+
+        Parameters
+        ----------
+        writes: dict[str, bytes]
+            Files to write.
+        deletes: iterable[str]
+            Files to delete.
+        preconditions: dict[str, str | None]
+            Required current version for each path. ``None`` means the file
+            must not exist.
+
+        Returns
+        -------
+        dict[str, str | None]
+            Version for each path after the batch; deleted paths map to ``None``.
+        """
+        raise ChangeSetUnsupported(
+            f"{type(self).__name__} does not support atomic change sets"
+        )
 
     def cat_ranges(
         self, paths, starts, ends, max_gap=None, on_error="return", **kwargs

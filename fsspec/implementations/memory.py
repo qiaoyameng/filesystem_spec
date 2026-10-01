@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from datetime import datetime, timezone
 from errno import ENOTEMPTY
 from io import BytesIO
@@ -8,6 +9,10 @@ from pathlib import PurePath, PureWindowsPath
 from typing import Any
 
 from fsspec import AbstractFileSystem
+from fsspec.exceptions import (
+    ChangeSetPreconditionFailed,
+    ChangeSetValidationError,
+)
 from fsspec.implementations.local import LocalFileSystem
 from fsspec.utils import stringify_path, tokenize
 
@@ -26,6 +31,9 @@ class MemoryFileSystem(AbstractFileSystem):
     pseudo_dirs = [""]  # shared by default
     protocol = "memory"
     root_marker = "/"
+    supports_atomic_changesets = True
+    _changeset_lock = threading.RLock()
+    _file_version_counter = 0
 
     def __init__(self, *args, global_store=True, **kwargs):
         """Create a memory filesystem.
@@ -45,6 +53,61 @@ class MemoryFileSystem(AbstractFileSystem):
         if not global_store:
             self.store = {}
             self.pseudo_dirs = [""]
+            self._changeset_lock = threading.RLock()
+            self._file_version_counter = 0
+
+    def _next_file_version(self):
+        with self._changeset_lock:
+            self._file_version_counter += 1
+            return str(self._file_version_counter)
+
+    def commit_changeset(self, writes=None, deletes=(), preconditions=None):
+        writes = {self._strip_protocol(k): v for k, v in (writes or {}).items()}
+        deletes = [self._strip_protocol(path) for path in deletes]
+        preconditions = {
+            self._strip_protocol(path): version
+            for path, version in (preconditions or {}).items()
+        }
+
+        with self._changeset_lock:
+            for path, required in preconditions.items():
+                current = self.store[path].ukey if path in self.store else None
+                if current != required:
+                    raise ChangeSetPreconditionFailed(
+                        f"precondition failed for {path!r}"
+                    )
+
+            try:
+                new_store = self.store.copy()
+                for path, value in writes.items():
+                    if path in self.pseudo_dirs:
+                        raise IsADirectoryError(path)
+                    parent = self._parent(path)
+                    while parent.strip("/"):
+                        if parent in new_store:
+                            raise NotADirectoryError(parent)
+                        parent = self._parent(parent)
+                    new_store[path] = MemoryFile(self, path, value)
+
+                for path in deletes:
+                    if path not in new_store:
+                        raise FileNotFoundError(path)
+                    del new_store[path]
+            except (
+                FileNotFoundError,
+                IsADirectoryError,
+                NotADirectoryError,
+            ) as exc:
+                raise ChangeSetValidationError(str(exc)) from exc
+
+            if self.global_store:
+                type(self).store = new_store
+            else:
+                self.store = new_store
+
+            result = {path: new_store[path].ukey for path in writes}
+            result.update({path: None for path in deletes})
+            return result
 
     @property
     def _fs_token(self):
@@ -335,15 +398,16 @@ class MemoryFileSystem(AbstractFileSystem):
     def cp_file(self, path1, path2, **kwargs):
         path1 = self._strip_protocol(path1)
         path2 = self._strip_protocol(path2)
-        if self.isfile(path1):
-            self.store[path2] = MemoryFile(
-                self, path2, self.store[path1].getvalue()
-            )  # implicit copy
-        elif self.isdir(path1):
-            if path2 not in self.pseudo_dirs:
-                self.pseudo_dirs.append(path2)
-        else:
-            raise FileNotFoundError(path1)
+        with self._changeset_lock:
+            if self.isfile(path1):
+                self.store[path2] = MemoryFile(
+                    self, path2, self.store[path1].getvalue()
+                )  # implicit copy
+            elif self.isdir(path1):
+                if path2 not in self.pseudo_dirs:
+                    self.pseudo_dirs.append(path2)
+            else:
+                raise FileNotFoundError(path1)
 
     def cat_file(self, path, start=None, end=None, **kwargs):
         logger.debug("cat: %s", path)
@@ -353,12 +417,20 @@ class MemoryFileSystem(AbstractFileSystem):
         except KeyError as e:
             raise FileNotFoundError(path) from e
 
-    def _rm(self, path):
+    def ukey(self, path):
         path = self._strip_protocol(path)
         try:
-            del self.store[path]
+            return self.store[path].ukey
         except KeyError as e:
             raise FileNotFoundError(path) from e
+
+    def _rm(self, path):
+        path = self._strip_protocol(path)
+        with self._changeset_lock:
+            try:
+                del self.store[path]
+            except KeyError as e:
+                raise FileNotFoundError(path) from e
 
     def modified(self, path):
         path = self._strip_protocol(path)
@@ -416,6 +488,7 @@ class MemoryFile(BytesIO):
         self.path = path
         self.created = datetime.now(tz=timezone.utc)
         self.modified = datetime.now(tz=timezone.utc)
+        self.ukey = fs._next_file_version() if fs is not None else None
         if data:
             super().__init__(data)
             self.seek(0)
@@ -434,5 +507,6 @@ class MemoryFile(BytesIO):
         pass
 
     def commit(self):
-        self.fs.store[self.path] = self
-        self.modified = datetime.now(tz=timezone.utc)
+        with self.fs._changeset_lock:
+            self.fs.store[self.path] = self
+            self.modified = datetime.now(tz=timezone.utc)

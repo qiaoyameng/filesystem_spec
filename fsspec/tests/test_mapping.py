@@ -7,8 +7,23 @@ import uuid
 import pytest
 
 import fsspec
+from fsspec.exceptions import (
+    ChangeSetPreconditionFailed,
+    ChangeSetState,
+    ChangeSetUnsupported,
+    ChangeSetValidationError,
+)
+from fsspec.spec import AbstractFileSystem
 from fsspec.implementations.local import LocalFileSystem
 from fsspec.implementations.memory import MemoryFileSystem
+
+
+class UnsupportedChangesetFileSystem(AbstractFileSystem):
+    protocol = "unsupported-changesets"
+    root_marker = ""
+
+    def _strip_protocol(self, path):
+        return str(path).removeprefix("unsupported-changesets://")
 
 
 def test_mapping_prefix(tmpdir):
@@ -270,3 +285,96 @@ def test_pop_existing_key_returns_and_removes_value(tmp_path, protocol):
 
     assert mapper.pop("key", None) == b"value"
     assert "key" not in mapper
+
+
+def test_memory_changeset_commits_writes_and_deletes_atomically():
+    fs = MemoryFileSystem(global_store=False, skip_instance_cache=True)
+    mapper = fsspec.FSMap("", fs)
+    mapper["old"] = b"old"
+    old_version = fs.ukey("/old")
+    changeset = mapper.changeset(
+        writes={"new": b"new", "replaced": b"one"},
+        deletes=["old"],
+        preconditions={"old": old_version, "missing": None},
+    )
+
+    result = changeset.commit(mapper)
+
+    assert changeset.state == ChangeSetState.COMMITTED
+    assert result["new"] == fs.ukey("/new")
+    assert result["replaced"] == fs.ukey("/replaced")
+    assert result["old"] is None
+    assert dict(mapper) == {"new": b"new", "replaced": b"one"}
+    assert fs.store is not mapper.fs.store or "/old" not in fs.store
+
+
+def test_memory_changeset_aborts_when_precondition_is_stale():
+    fs = MemoryFileSystem(global_store=False, skip_instance_cache=True)
+    mapper = fsspec.FSMap("", fs)
+    mapper["key"] = b"one"
+    version = fs.ukey("/key")
+    changeset = mapper.changeset(
+        writes={"key": b"two", "other": b"three"},
+        preconditions={"key": version},
+    )
+    mapper["key"] = b"newer"
+
+    with pytest.raises(ChangeSetPreconditionFailed):
+        changeset.commit(mapper)
+
+    assert changeset.state == ChangeSetState.ABORTED
+    assert mapper["key"] == b"newer"
+    assert "other" not in mapper
+
+    with pytest.raises(ChangeSetValidationError) as info:
+        changeset.commit(mapper)
+    assert info.value.state == ChangeSetState.ABORTED
+    assert mapper["key"] == b"newer"
+    assert "other" not in mapper
+
+
+def test_changeset_rejects_collision_before_backend_call():
+    fs = MemoryFileSystem(global_store=False, skip_instance_cache=True)
+    mapper = fsspec.FSMap("", fs)
+    changeset = mapper.changeset(writes={"1": b"x"}, deletes=[1])
+
+    with pytest.warns(DeprecationWarning):
+        with pytest.raises(ChangeSetValidationError):
+            changeset.commit(mapper)
+
+    assert changeset.state == ChangeSetState.ABORTED
+
+
+def test_changeset_rejects_unsupported_backend_without_writing():
+    fs = UnsupportedChangesetFileSystem(skip_instance_cache=True)
+    called = []
+    fs.commit_changeset = lambda **kwargs: called.append(kwargs)
+    mapper = fsspec.FSMap("", fs)
+    changeset = mapper.changeset(writes={"key": b"value"})
+
+    with pytest.raises(ChangeSetUnsupported):
+        changeset.commit(mapper)
+
+    assert changeset.state == ChangeSetState.ABORTED
+    assert called == []
+
+
+def test_non_atomic_changeset_does_not_require_backend_capability():
+    fs = UnsupportedChangesetFileSystem(skip_instance_cache=True)
+    writes = {}
+    fs.pipe = lambda values: writes.update(values)
+    fs.rm = lambda paths: None
+    fs.isfile = lambda path: False
+    fs.ukey = lambda path: None
+    fs._parent = lambda path: ""
+    fs.mkdirs = lambda path, exist_ok=True: None
+    mapper = fsspec.FSMap("", fs)
+    changeset = mapper.changeset(
+        writes={"key": b"value"}, deletes=["gone"], atomic=False
+    )
+
+    result = changeset.commit(mapper)
+
+    assert changeset.state == ChangeSetState.COMMITTED
+    assert result == {"key": None, "gone": None}
+    assert writes == {"key": b"value"}
