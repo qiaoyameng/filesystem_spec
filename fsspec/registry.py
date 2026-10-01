@@ -195,6 +195,7 @@ known_implementations = {
         "class": "ossfs.OSSFileSystem",
         "err": "Install ossfs to access Alibaba Object Storage System",
     },
+    "overlay": {"class": "fsspec.implementations.overlay.OverlayFileSystem"},
     "pyscript": {
         "class": "pyscript_fsspec_client.client.PyscriptFileSystem",
         "err": "This only runs in a pyscript context",
